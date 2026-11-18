@@ -11,21 +11,26 @@ function showPage(id){
     window.scrollTo(0, 0);
 }
 
-// Checklist state manager
-const checklistKey = e => "an_v7_" + encodeURIComponent(e.parentElement.querySelector("span").textContent.trim());
-const boxes = [...document.querySelectorAll("input[type=checkbox]")];
+// Strip any query parameters so the URL stays 100% clean across all devices
+if (location.search) {
+    try {
+        const cleanUrl = location.origin + location.pathname + (location.hash || '');
+        history.replaceState(null, '', cleanUrl);
+    } catch(e) {}
+}
 
-// Map elements for fast lookups
-const keyToBox = new Map();
-boxes.forEach(b => {
-    keyToBox.set(checklistKey(b), b);
-});
+// Checklist state manager
+const checklistKey = e => "an_v8_" + encodeURIComponent(e.parentElement.querySelector("span").textContent.trim());
+const boxes = [...document.querySelectorAll("input[type=checkbox]")];
 
 function getLocalState() {
     const checked = [];
     boxes.forEach(e => {
         const k = checklistKey(e);
         let val = localStorage.getItem(k);
+        if (val === null) {
+            val = localStorage.getItem("an_v7_" + encodeURIComponent(e.parentElement.querySelector("span").textContent.trim()));
+        }
         if (val === null) {
             val = localStorage.getItem("an_v6_" + encodeURIComponent(e.parentElement.querySelector("span").textContent.trim()));
         }
@@ -48,33 +53,6 @@ function applyState(checkedKeys, saveToStorage = true) {
     });
 }
 
-function encodeState(keys) {
-    const bytes = new TextEncoder().encode(JSON.stringify(keys));
-    let binary = "";
-    bytes.forEach(b => binary += String.fromCharCode(b));
-    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function decodeState(str) {
-    try {
-        const decoded = atob(str.replace(/-/g, "+").replace(/_/g, "/"));
-        const bytes = Uint8Array.from(decoded, c => c.charCodeAt(0));
-        return JSON.parse(new TextDecoder().decode(bytes));
-    } catch(err) {
-        return null;
-    }
-}
-
-// Auto link sync via URL query parameters
-function updateUrlWithState(checkedKeys) {
-    try {
-        const encoded = encodeState(checkedKeys);
-        const url = new URL(location.href);
-        url.searchParams.set("checks", encoded);
-        history.replaceState(null, "", url.toString());
-    } catch(e) {}
-}
-
 const syncDot = document.getElementById("syncDot");
 const syncText = document.getElementById("syncText");
 
@@ -85,106 +63,65 @@ function updateSyncStatus(status, text) {
     }
 }
 
-// Initial state load: URL parameters take precedence, then localStorage
-const urlParams = new URLSearchParams(location.search);
-let isInitialized = false;
+// Central Cloud Database for cross-device persistence
+const DB_TOPIC = "anagha_nihar_wedding_photo_brief_master_db";
+const CLIENT_ID = Math.random().toString(36).slice(2) + Date.now();
+let lastDbTimestamp = 0;
+let dbPushTimer = null;
 
-if (urlParams.has("checks")) {
-    const fromUrl = decodeState(urlParams.get("checks"));
-    if (Array.isArray(fromUrl) && fromUrl.length > 0) {
-        applyState(fromUrl, true);
-        isInitialized = true;
-    }
-}
-
-if (!isInitialized) {
-    const local = getLocalState();
-    applyState(local, false);
-    if (local.length > 0) {
-        updateUrlWithState(local);
-    }
-}
+// Load local cache immediately for instantaneous rendering
+const localInitial = getLocalState();
+applyState(localInitial, false);
 
 // Cross-tab synchronization via BroadcastChannel
-const bc = window.BroadcastChannel ? new BroadcastChannel("anagha_nihar_wedding_channel") : null;
+const bc = window.BroadcastChannel ? new BroadcastChannel("anagha_nihar_db_channel") : null;
 if (bc) {
     bc.onmessage = (ev) => {
         if (ev.data && ev.data.type === "CHECKLIST_UPDATE" && Array.isArray(ev.data.checked)) {
             applyState(ev.data.checked, true);
-            updateUrlWithState(ev.data.checked);
-            updateSyncStatus("synced", "Synced across tabs");
+            updateSyncStatus("synced", "Connected & Synced");
         }
     };
 }
 
-// Real-time Cloud Synchronization (auto-syncing across devices)
-const SYNC_TOPIC = "anagha_nihar_wedding_photo_brief_live";
-const CLIENT_ID = Math.random().toString(36).slice(2) + Date.now();
-let lastCloudTimestamp = 0;
-let cloudSyncTimer = null;
-
-async function pushToCloud(checkedKeys) {
-    updateSyncStatus("syncing", "Syncing...");
+// Save to cloud database
+async function pushToDb(checkedKeys) {
+    updateSyncStatus("syncing", "Saving to database...");
+    const timestamp = Date.now();
+    lastDbTimestamp = timestamp;
     try {
         const payload = JSON.stringify({
             client: CLIENT_ID,
-            time: Date.now(),
+            time: timestamp,
             checked: checkedKeys
         });
-        await fetch(`https://ntfy.sh/${SYNC_TOPIC}`, {
+        await fetch(`https://ntfy.sh/${DB_TOPIC}`, {
             method: "POST",
             body: payload,
             headers: {
-                "Title": "Checklist Update",
+                "Title": "db_update",
                 "X-Cache": "yes"
             }
         });
-        updateSyncStatus("synced", "Live & Auto-Synced");
+        updateSyncStatus("synced", "Connected & Synced");
     } catch(err) {
-        // Fallback status if offline
         updateSyncStatus("synced", "Saved locally (Offline)");
     }
 }
 
-function schedulePush() {
-    clearTimeout(cloudSyncTimer);
-    cloudSyncTimer = setTimeout(() => {
+function scheduleDbPush() {
+    clearTimeout(dbPushTimer);
+    dbPushTimer = setTimeout(() => {
         const checked = [];
         boxes.forEach(e => { if (e.checked) checked.push(checklistKey(e)); });
-        pushToCloud(checked);
-    }, 400);
+        pushToDb(checked);
+    }, 300);
 }
 
-// Connect to real-time stream (Server-Sent Events) for instant cross-device updates
-function initRealtimeCloudSync() {
+// Fetch database state on initial launch (fresh device or new browser)
+async function fetchDatabaseState() {
     try {
-        const evtSource = new EventSource(`https://ntfy.sh/${SYNC_TOPIC}/sse`);
-        evtSource.onmessage = (event) => {
-            try {
-                const data = JSON.parse(event.data);
-                if (data && data.event === "message" && data.message) {
-                    const parsed = JSON.parse(data.message);
-                    if (parsed && parsed.client !== CLIENT_ID && Array.isArray(parsed.checked)) {
-                        if (!parsed.time || parsed.time > lastCloudTimestamp) {
-                            lastCloudTimestamp = parsed.time || Date.now();
-                            applyState(parsed.checked, true);
-                            updateUrlWithState(parsed.checked);
-                            updateSyncStatus("synced", "Auto-synced from device");
-                        }
-                    }
-                }
-            } catch(e) {}
-        };
-        evtSource.onerror = () => {
-            // Auto reconnects in background
-        };
-    } catch(e) {}
-}
-
-// Also fetch latest cloud snapshot on page open
-async function fetchLatestCloudState() {
-    try {
-        const res = await fetch(`https://ntfy.sh/${SYNC_TOPIC}/json?poll=1&since=all`);
+        const res = await fetch(`https://ntfy.sh/${DB_TOPIC}/json?poll=1&since=all`);
         if (res.ok) {
             const text = await res.text();
             const lines = text.trim().split("\n");
@@ -203,17 +140,43 @@ async function fetchLatestCloudState() {
                 } catch(e) {}
             }
             if (latestMsg && latestMsg.checked) {
-                lastCloudTimestamp = latestMsg.time || Date.now();
+                lastDbTimestamp = latestMsg.time || Date.now();
                 applyState(latestMsg.checked, true);
-                updateUrlWithState(latestMsg.checked);
-                updateSyncStatus("synced", "Live & Auto-Synced");
+                updateSyncStatus("synced", "Connected & Synced");
+            } else if (localInitial.length > 0) {
+                pushToDb(localInitial);
             }
         }
     } catch(e) {}
 }
 
-initRealtimeCloudSync();
-fetchLatestCloudState();
+// Real-time synchronization stream for active sessions across devices
+function listenToDatabaseStream() {
+    try {
+        const evtSource = new EventSource(`https://ntfy.sh/${DB_TOPIC}/sse`);
+        evtSource.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                if (data && data.event === "message" && data.message) {
+                    const parsed = JSON.parse(data.message);
+                    if (parsed && parsed.client !== CLIENT_ID && Array.isArray(parsed.checked)) {
+                        if (!parsed.time || parsed.time > lastDbTimestamp) {
+                            lastDbTimestamp = parsed.time || Date.now();
+                            applyState(parsed.checked, true);
+                            updateSyncStatus("synced", "Connected & Synced");
+                        }
+                    }
+                }
+            } catch(e) {}
+        };
+        evtSource.onerror = () => {
+            // Reconnects automatically
+        };
+    } catch(e) {}
+}
+
+fetchDatabaseState();
+listenToDatabaseStream();
 
 function onChecklistChange() {
     const checked = [];
@@ -223,13 +186,11 @@ function onChecklistChange() {
         if (e.checked) checked.push(k);
     });
 
-    updateUrlWithState(checked);
-
     if (bc) {
         bc.postMessage({ type: "CHECKLIST_UPDATE", checked });
     }
 
-    schedulePush();
+    scheduleDbPush();
 }
 
 boxes.forEach(e => {
